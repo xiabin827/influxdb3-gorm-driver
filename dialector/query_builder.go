@@ -15,9 +15,14 @@ import (
 )
 
 // Query 执行查询
-func (dialector *Dialector) Query(ctx context.Context, db *gorm.DB, query string, args ...interface{}) (rows *QueryRows, err error) {
+func (dialector *Dialector) Query(ctx context.Context, db *gorm.DB, query string, args ...any) (rows *QueryRows, err error) {
 	if dialector.Client == nil {
 		return nil, errors.New("未初始化InfluxDB客户端")
+	}
+
+	// 检查查询是否为空
+	if query == "" {
+		return nil, errors.New("查询语句为空")
 	}
 
 	// 转换GORM生成的SQL查询为InfluxDB查询
@@ -26,10 +31,20 @@ func (dialector *Dialector) Query(ctx context.Context, db *gorm.DB, query string
 		return nil, fmt.Errorf("转换查询失败: %w", err)
 	}
 
+	// 再次检查转换后的查询是否为空
+	if influxQuery == "" {
+		return nil, errors.New("转换后的查询语句为空")
+	}
+
 	// 执行查询
 	iterator, err := dialector.Client.Query(ctx, influxQuery)
 	if err != nil {
 		return nil, fmt.Errorf("执行查询失败: %w", err)
+	}
+
+	// 确保迭代器不为空
+	if iterator == nil {
+		return nil, errors.New("查询结果为空")
 	}
 
 	// 将结果包装为GORM可用的格式
@@ -40,7 +55,7 @@ func (dialector *Dialector) Query(ctx context.Context, db *gorm.DB, query string
 }
 
 // 转换GORM查询为InfluxDB查询
-func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...interface{}) (string, error) {
+func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...any) (string, error) {
 	if query != "" {
 		// 如果提供了原始SQL查询，直接使用
 		return query, nil
@@ -48,8 +63,24 @@ func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...in
 
 	// 从GORM语句构建查询
 	stmt := db.Statement
-	if stmt.Schema == nil || stmt.Table == "" {
-		return "", errors.New("缺少表或schema信息")
+	if stmt == nil {
+		return "", errors.New("语句对象为空")
+	}
+
+	if stmt.Schema == nil {
+		return "", errors.New("缺少schema信息")
+	}
+
+	if stmt.Table == "" {
+		// 尝试从Schema获取表名
+		if stmt.Schema != nil {
+			stmt.Table = stmt.Schema.Table
+		}
+
+		// 如果表名仍为空，返回错误
+		if stmt.Table == "" {
+			return "", errors.New("缺少表信息")
+		}
 	}
 
 	// 获取表名和字段
@@ -149,7 +180,7 @@ func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...in
 				if i > 0 {
 					queryBuilder.WriteString(", ")
 				}
-				queryBuilder.WriteString(dialector.QuoteString(column.Column.(string)))
+				queryBuilder.WriteString(dialector.QuoteString(fmt.Sprint(column.Column)))
 				if column.Desc {
 					queryBuilder.WriteString(" DESC")
 				}
@@ -163,8 +194,8 @@ func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...in
 			if limit.Limit != nil {
 				queryBuilder.WriteString(fmt.Sprintf(" LIMIT %d", *limit.Limit))
 			}
-			if limit.Offset != nil && *limit.Offset > 0 {
-				queryBuilder.WriteString(fmt.Sprintf(" OFFSET %d", *limit.Offset))
+			if limit.Offset > 0 {
+				queryBuilder.WriteString(fmt.Sprintf(" OFFSET %d", limit.Offset))
 			}
 		}
 	}
@@ -173,7 +204,7 @@ func (dialector *Dialector) translateQuery(db *gorm.DB, query string, args ...in
 }
 
 // 格式化值
-func formatValue(value interface{}) string {
+func formatValue(value any) string {
 	switch v := value.(type) {
 	case string:
 		return fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''"))
@@ -195,20 +226,36 @@ func (dialector Dialector) QuoteString(str string) string {
 type QueryRows struct {
 	Iterator *influxdb3.QueryIterator
 	Schema   *schema.Schema
-	rowData  map[string]interface{}
+	rowData  map[string]any
 	columns  []string
 	current  bool
+	err      error // 存储迭代过程中的错误
 }
 
 // Next 移动到下一行
 func (r *QueryRows) Next() bool {
 	if r.Iterator == nil {
+		r.err = errors.New("查询迭代器为空")
 		return false
 	}
 
+	// 捕获可能的 panic
+	defer func() {
+		if p := recover(); p != nil {
+			r.err = fmt.Errorf("迭代过程中发生panic: %v", p)
+			r.current = false
+		}
+	}()
+
 	r.current = r.Iterator.Next()
 	if r.current {
+		// 安全地获取当前行数据
 		r.rowData = r.Iterator.Value()
+		if r.rowData == nil {
+			r.err = errors.New("迭代器返回的行数据为空")
+			r.current = false
+			return false
+		}
 
 		// 第一次获取列名
 		if len(r.columns) == 0 && len(r.rowData) > 0 {
@@ -216,26 +263,65 @@ func (r *QueryRows) Next() bool {
 				r.columns = append(r.columns, key)
 			}
 		}
+	} else {
+		// 检查迭代器错误
+		if err := r.Iterator.Err(); err != nil {
+			r.err = fmt.Errorf("迭代器错误: %w", err)
+		}
 	}
 
 	return r.current
 }
 
+// Err 返回迭代过程中的错误
+func (r *QueryRows) Err() error {
+	return r.err
+}
+
 // Scan 扫描当前行到目标变量
-func (r *QueryRows) Scan(dest ...interface{}) error {
-	if !r.current || r.rowData == nil {
-		return errors.New("没有当前行数据")
+func (r *QueryRows) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	if !r.current {
+		return errors.New("没有当前行数据，请先调用Next()")
+	}
+
+	if r.rowData == nil {
+		return errors.New("当前行数据为空")
+	}
+
+	// 确保有足够的列
+	if len(r.columns) == 0 {
+		return errors.New("没有列信息")
 	}
 
 	if len(dest) != len(r.columns) {
 		return fmt.Errorf("列数(%d)与目标变量数(%d)不匹配", len(r.columns), len(dest))
 	}
 
+	// 捕获可能的 panic
+	defer func() {
+		if p := recover(); p != nil {
+			r.err = fmt.Errorf("扫描过程中发生panic: %v", p)
+		}
+	}()
+
 	for i, colName := range r.columns {
 		if val, ok := r.rowData[colName]; ok {
+			// 跳过nil值
+			if val == nil {
+				continue
+			}
+
 			destVal := reflect.ValueOf(dest[i])
 			if destVal.Kind() != reflect.Ptr {
 				return fmt.Errorf("目标值必须是指针，列 %s", colName)
+			}
+
+			if !destVal.IsValid() || destVal.IsNil() {
+				return fmt.Errorf("目标指针无效或为nil，列 %s", colName)
 			}
 
 			destElem := destVal.Elem()
