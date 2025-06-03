@@ -35,6 +35,81 @@ func (r driverRows) Close() error {
 }
 
 func (r driverRows) Next(dest []driver.Value) error {
+	// 如果是第一行且已经预先获取，则直接使用
+	if r.InfluxDBRows.current {
+		// 获取当前行的数据
+		cols, _ := r.InfluxDBRows.Columns()
+
+		// 检查是否有列存在，如果为空则跳过处理
+		if len(cols) == 0 {
+			r.InfluxDBRows.current = false
+			return nil
+		}
+
+		// 如果没有目标变量但有列，这是一个特殊情况
+		// 在sql.Rows.Next()调用期间可能发生，此时只需返回成功
+		if len(dest) == 0 {
+			r.InfluxDBRows.current = false
+			return nil
+		}
+
+		// 如果列数与目标变量数不匹配，使用可用的列数
+		colsToProcess := len(cols)
+		if len(dest) < colsToProcess {
+			colsToProcess = len(dest)
+		}
+
+		// 将当前行的数据复制到目标变量
+		for i := 0; i < colsToProcess; i++ {
+			col := cols[i]
+			val, ok := r.InfluxDBRows.rowData[col]
+			if !ok {
+				dest[i] = nil
+				continue
+			}
+
+			// 根据不同的数据类型进行转换
+			switch v := val.(type) {
+			case string:
+				dest[i] = v
+			case int:
+				dest[i] = int64(v)
+			case int32:
+				dest[i] = int64(v)
+			case int64:
+				dest[i] = v
+			case float32:
+				dest[i] = float64(v)
+			case float64:
+				// 特殊处理：如果是COUNT函数的结果，转换为整数
+				if strings.Contains(strings.ToLower(col), "count(") || strings.Contains(strings.ToLower(col), "count") ||
+					col == "action_type" || col == "duration" {
+					dest[i] = int64(v)
+				} else {
+					dest[i] = v
+				}
+			case bool:
+				dest[i] = v
+			case time.Time:
+				dest[i] = v
+			case nil:
+				dest[i] = nil
+			default:
+				dest[i] = fmt.Sprintf("%v", v)
+			}
+		}
+
+		// 将剩余的目标变量设置为nil
+		for i := colsToProcess; i < len(dest); i++ {
+			dest[i] = nil
+		}
+
+		// 标记已处理第一行
+		r.InfluxDBRows.current = false
+		return nil
+	}
+
+	// 对于后续行，使用正常的Next方法
 	if !r.InfluxDBRows.Next() {
 		if err := r.InfluxDBRows.Err(); err != nil {
 			return err
@@ -47,6 +122,12 @@ func (r driverRows) Next(dest []driver.Value) error {
 
 	// 检查是否有列存在，如果为空则跳过处理
 	if len(cols) == 0 {
+		return nil
+	}
+
+	// 如果没有目标变量但有列，这是一个特殊情况
+	// 在sql.Rows.Next()调用期间可能发生，此时只需返回成功
+	if len(dest) == 0 {
 		return nil
 	}
 
@@ -78,8 +159,9 @@ func (r driverRows) Next(dest []driver.Value) error {
 		case float32:
 			dest[i] = float64(v)
 		case float64:
-			// 如果列名包含"action_type"或"duration"，转换为整数
-			if col == "action_type" || col == "duration" {
+			// 特殊处理：如果是COUNT函数的结果，转换为整数
+			if strings.Contains(strings.ToLower(col), "count(") || strings.Contains(strings.ToLower(col), "count") ||
+				col == "action_type" || col == "duration" {
 				dest[i] = int64(v)
 			} else {
 				dest[i] = v
@@ -236,6 +318,100 @@ func (r *InfluxDBRows) Scan(dest ...any) error {
 		return errors.New("没有当前行")
 	}
 
+	// 如果只有一个目标变量且只有一列，直接将该列的值赋给目标变量
+	if len(dest) == 1 && len(r.columns) == 1 {
+		val, ok := r.rowData[r.columns[0]]
+		if !ok {
+			return fmt.Errorf("列 %s 不存在", r.columns[0])
+		}
+
+		fmt.Printf("调试 - 单列值: %v (类型: %T)\n", val, val)
+
+		// 根据目标变量类型进行转换
+		switch d := dest[0].(type) {
+		case *int64:
+			switch v := val.(type) {
+			case int:
+				*d = int64(v)
+				fmt.Printf("调试 - 转换 int -> int64: %d\n", *d)
+			case int64:
+				*d = v
+				fmt.Printf("调试 - 保持 int64: %d\n", *d)
+			case float64:
+				*d = int64(v)
+				fmt.Printf("调试 - 转换 float64 -> int64: %d\n", *d)
+			case nil:
+				*d = 0
+				fmt.Println("调试 - 设置为默认值 0")
+			default:
+				return fmt.Errorf("无法将 %T 转换为 int64", val)
+			}
+		case *int:
+			switch v := val.(type) {
+			case int:
+				*d = v
+			case int64:
+				*d = int(v)
+			case float64:
+				*d = int(v)
+			case nil:
+				*d = 0
+			default:
+				return fmt.Errorf("无法将 %T 转换为 int", val)
+			}
+		case *float64:
+			switch v := val.(type) {
+			case float64:
+				*d = v
+			case int:
+				*d = float64(v)
+			case int64:
+				*d = float64(v)
+			case nil:
+				*d = 0
+			default:
+				return fmt.Errorf("无法将 %T 转换为 float64", val)
+			}
+		case *string:
+			switch v := val.(type) {
+			case string:
+				*d = v
+			case nil:
+				*d = ""
+			default:
+				*d = fmt.Sprintf("%v", v)
+			}
+		case *bool:
+			switch v := val.(type) {
+			case bool:
+				*d = v
+			case nil:
+				*d = false
+			default:
+				return fmt.Errorf("无法将 %T 转换为 bool", val)
+			}
+		case *time.Time:
+			switch v := val.(type) {
+			case time.Time:
+				*d = v
+			case string:
+				if t, err := time.Parse(time.RFC3339, v); err == nil {
+					*d = t
+				} else {
+					return fmt.Errorf("无法将字符串 %s 转换为时间: %v", v, err)
+				}
+			case nil:
+				*d = time.Time{}
+			default:
+				return fmt.Errorf("无法将 %T 转换为 time.Time", val)
+			}
+		default:
+			return fmt.Errorf("不支持的目标类型: %T", dest[0])
+		}
+		return nil
+	}
+
+	// 处理多列情况
 	if len(dest) != len(r.columns) {
 		return fmt.Errorf("目标数量 (%d) 与列数 (%d) 不匹配", len(dest), len(r.columns))
 	}
@@ -411,8 +587,17 @@ func (p *InfluxDBConnPool) QueryContext(ctx context.Context, query string, args 
 
 // QueryRowContext 实现 gorm.ConnPool 接口
 func (p *InfluxDBConnPool) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	// 简化实现
-	return &sql.Row{}
+	// 创建一个自定义的 driver.Conn 实现
+	connector := &driverConnector{
+		pool: p,
+	}
+
+	// 创建标准的sql.DB对象
+	db := sql.OpenDB(connector)
+	defer db.Close()
+
+	// 执行实际查询
+	return db.QueryRowContext(ctx, query, args...)
 }
 
 // BeginTx 实现 gorm.ConnPool 接口
@@ -829,14 +1014,21 @@ func (c *driverConn) Query(query string, args []driver.Value) (driver.Rows, erro
 		columns:  []string{}, // 初始化为空切片而不是nil
 	}
 
-	// 预先获取第一条数据以填充列信息
-	if influxRows.Next() {
-		// 获取列名
-		columns, err := influxRows.Columns()
-		if err != nil {
-			return nil, err
+	// 预先获取第一行数据以填充列信息
+	if iterator.Next() {
+		// 获取第一行数据
+		rowData := iterator.Value()
+		if rowData != nil {
+			// 保存行数据
+			influxRows.rowData = rowData
+			influxRows.current = true
+
+			// 提取列名
+			influxRows.columns = make([]string, 0, len(rowData))
+			for key := range rowData {
+				influxRows.columns = append(influxRows.columns, key)
+			}
 		}
-		influxRows.columns = columns
 	}
 
 	// 返回包装后的行对象
